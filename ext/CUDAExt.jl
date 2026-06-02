@@ -51,7 +51,9 @@ end
 function Dagger.aliasing(x::CuArray{T}) where T
     space = Dagger.memory_space(x)
     S = typeof(space)
-    cuptr = pointer(x)
+    cuptr = with_context(x) do
+        pointer(x)
+    end
     rptr = Dagger.RemotePtr{Cvoid}(UInt64(cuptr), space)
     return Dagger.ContiguousAliasing(Dagger.MemorySpan{S}(rptr, sizeof(T)*length(x)))
 end
@@ -73,32 +75,41 @@ function to_context(proc::CuArrayDeviceProc)
     return CONTEXTS[proc.device]
 end
 to_context(handle::Integer) = CONTEXTS[handle]
-to_context(dev::CuDevice) = to_context(dev.handle)
+to_context(dev::CuDevice) = to_context(dev.handle)  
 
-function with_context!(handle::Integer)
+function with_context!(handle::Integer, stream_idx = 1)
     context!(CONTEXTS[handle])
-    stream!(STREAMS[handle])
+    stream!(STREAMS[handle][stream_idx])
 end
-function with_context!(proc::CuArrayDeviceProc)
+function with_context!(proc::CuArrayDeviceProc, stream_idx = 1)
     @assert Dagger.root_worker_id(proc) == myid()
-    with_context!(proc.device)
+    with_context!(proc.device, stream_idx)
 end
-function with_context!(space::CUDAVRAMMemorySpace)
+function with_context!(space::CUDAVRAMMemorySpace, stream_idx = 1)
     @assert Dagger.root_worker_id(space) == myid()
-    with_context!(space.device)
+    with_context!(space.device, stream_idx)
+end
+function  with_context!(array::CuArray, stream_idx = 1)
+    with_context!(CUDA.device(array).handle, stream_idx)
 end
 Dagger.with_context!(proc::CuArrayDeviceProc) = with_context!(proc)
 Dagger.with_context!(space::CUDAVRAMMemorySpace) = with_context!(space)
-function with_context(f, x)
-    old_ctx = context()
-    old_stream = stream()
+function with_context(f, x, stream_idx = 1)
+    exist = CUDA.task_local_state() !== nothing
 
-    with_context!(x)
+    if exist
+        old_ctx = context()
+        old_stream = stream()
+    end
+
+    with_context!(x, stream_idx)
     try
         f()
     finally
-        context!(old_ctx)
-        stream!(old_stream)
+        if exist
+            context!(old_ctx)
+            stream!(old_stream)
+        end
     end
 end
 
@@ -216,9 +227,10 @@ function Dagger.move(from_proc::CuArrayDeviceProc, to_proc::CuArrayDeviceProc, x
     elseif Dagger.root_worker_id(from_proc) == Dagger.root_worker_id(to_proc)
         # Same process but different GPUs, use DtoD copy
         from_arr = unwrap(x)
-        ev = CUDA.CuEvent()
-        with_context(from_proc) do
+        ev = with_context(from_proc) do
+            ev = CUDA.CuEvent()
             CUDA.record(ev, stream())
+            return ev
         end
         
         return with_context(to_proc) do
@@ -273,9 +285,11 @@ function Dagger.move(from_proc::CuArrayDeviceProc, to_proc::CuArrayDeviceProc, x
     if from_proc == to_proc
         return x
     elseif Dagger.root_worker_id(from_proc) == Dagger.root_worker_id(to_proc)
-        ev = CUDA.CuEvent()
-        with_context(from_proc) do
+        
+        ev = with_context(from_proc) do
+            ev = CUDA.CuEvent()
             CUDA.record(ev, stream())
+            return ev
         end
         
         return with_context(to_proc) do
@@ -302,13 +316,33 @@ Dagger.move(from_proc::CPUProc, to_proc::CuArrayDeviceProc, x::Function) = x
 Dagger.move(from_proc::CPUProc, to_proc::CuArrayDeviceProc, x::Chunk{T}) where {T<:Function} =
     Dagger.move(from_proc, to_proc, fetch(x))
 
+const ROUNDROBIN = Dict{Int, Threads.Atomic{Int}}()
+
 # Task execution
 function Dagger.execute!(proc::CuArrayDeviceProc, f, args...; kwargs...)
     @nospecialize f args kwargs
+    opt = Dagger.get_options()
     tls = Dagger.get_tls()
+    mydev = proc.device
+    cr_str = mod1(Threads.atomic_add!(ROUNDROBIN[mydev], 1), length(STREAMS[mydev]))
+    mytid = Dagger.task_id()
     task = Threads.@spawn begin
         Dagger.set_tls!(tls)
-        with_context!(proc)
+        with_context!(proc, cr_str)
+        lock(SYNCDEPS) do deps
+            local_sync = Dagger._has_option(opt, :syncdeps) ? Dagger.get_options(:syncdeps) : nothing
+            if !isnothing(local_sync)
+                local_sync = map(syncdep -> syncdep.id.id, collect(local_sync))
+                for syncdep in local_sync
+                    (dev, stream) = deps[syncdep]
+                    ev = CUDA.CuEvent()
+                    CUDA.record(ev, STREAMS[dev][stream])
+                    CUDA.wait(ev, STREAMS[mydev][cr_str]) #cr_str is an Int not a custream            
+                end
+            end
+            deps[mytid] = (mydev, cr_str)
+        end
+        
         result = Base.@invokelatest f(args...; kwargs...)
         # N.B. Synchronization must be done when accessing result or args
         return result
@@ -403,7 +437,7 @@ function Dagger.gpu_synchronize(proc::CuArrayDeviceProc)
 
     with_context(proc) do
         ev = CUDA.CuEvent()
-        CUDA.record(ev, stream()) 
+        CUDA.record(ev, stream())
         CUDA.wait(ev, user_stream)
 
     end
@@ -445,11 +479,13 @@ Dagger.scope_key_precedence(::Val{:cuda_gpus}) = 1
 
 const DEVICES = Dict{Int, CuDevice}()
 const CONTEXTS = Dict{Int, CuContext}()
-const STREAMS = Dict{Int, CuStream}()
+const STREAMS = Dict{Int, Vector{CuStream}}()
+const SYNCDEPS = Dagger.LockedObject(Dict{Int, Tuple{Int,Int}}())
 
 function __init__()
     if CUDA.has_cuda()
         for dev in CUDA.devices()
+            ROUNDROBIN[dev.handle] = Threads.Atomic{Int}(1)
             @debug "Registering CUDA GPU processor with Dagger: $dev"
             Dagger.add_processor_callback!("cuarray_device_$(dev.handle)") do
                 proc = CuArrayDeviceProc(myid(), dev.handle, CUDA.uuid(dev))
@@ -457,7 +493,10 @@ function __init__()
                 ctx = context(dev)
                 CONTEXTS[dev.handle] = ctx
                 context!(ctx) do
-                    STREAMS[dev.handle] = stream()
+                    num_sm = 4
+                    #Int(CUDA.attribute(dev, CUDA.DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT))
+                    num_streams =  num_sm
+                    STREAMS[dev.handle] = [CuStream() for _ in 1:num_streams]
                 end
                 return proc
             end
