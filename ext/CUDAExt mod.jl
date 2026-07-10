@@ -51,7 +51,9 @@ end
 function Dagger.aliasing(x::CuArray{T}) where T
     space = Dagger.memory_space(x)
     S = typeof(space)
-    cuptr = pointer(x)
+    cuptr = with_context(x) do
+        pointer(x)
+    end
     rptr = Dagger.RemotePtr{Cvoid}(UInt64(cuptr), space)
     return Dagger.ContiguousAliasing(Dagger.MemorySpan{S}(rptr, sizeof(T)*length(x)))
 end
@@ -73,41 +75,58 @@ function to_context(proc::CuArrayDeviceProc)
     return CONTEXTS[proc.device]
 end
 to_context(handle::Integer) = CONTEXTS[handle]
-to_context(dev::CuDevice) = to_context(dev.handle)
+to_context(dev::CuDevice) = to_context(dev.handle)  
 
-function with_context!(handle::Integer, stream = 1)
+function with_context!(handle::Integer, stream_idx = 1)
     context!(CONTEXTS[handle])
-    stream!(STREAMS[handle][stream])
+    stream!(STREAMS[handle][stream_idx])
 end
-function with_context!(proc::CuArrayDeviceProc, stream = 1)
+function with_context!(proc::CuArrayDeviceProc, stream_idx = 1)
     @assert Dagger.root_worker_id(proc) == myid()
-    with_context!(proc.device, stream)
+    with_context!(proc.device, stream_idx)
 end
-function with_context!(space::CUDAVRAMMemorySpace, stream = 1)
+function with_context!(space::CUDAVRAMMemorySpace, stream_idx = 1)
     @assert Dagger.root_worker_id(space) == myid()
-    with_context!(space.device, stream)
+    with_context!(space.device, stream_idx)
+end
+function  with_context!(array::CuArray, stream_idx = 1)
+    with_context!(CUDA.device(array).handle, stream_idx)
 end
 Dagger.with_context!(proc::CuArrayDeviceProc) = with_context!(proc)
 Dagger.with_context!(space::CUDAVRAMMemorySpace) = with_context!(space)
-function with_context(f, x, stream = 1)
-    old_ctx = context()
-    old_stream = stream()
+function with_context(f, x, stream_idx = 1)
+    exist = CUDA.task_local_state() !== nothing
 
-    with_context!(x, stream)
+    if exist
+        old_ctx = context()
+        old_stream = stream()
+    end
+
+    with_context!(x, stream_idx)
     try
         f()
     finally
-        context!(old_ctx)
-        stream!(old_stream)
+        if exist
+            context!(old_ctx)
+            stream!(old_stream)
+        end
     end
 end
 
 function _sync_with_context(x::Union{Dagger.Processor,Dagger.MemorySpace})
     caller_stream = stream()
     with_context(x) do
-        ev = CUDA.CuEvent()
-        CUDA.record(ev, stream())
-        CUDA.wait(ev, caller_stream)
+        # We don't track which round-robin stream produced this data in the
+        # move path, so make the caller wait on *every* stream of the device.
+        # Recording on `stream()` alone only ever caught STREAMS[dev][1], which
+        # is almost always idle -> the wait was a no-op and the copy raced the
+        # real producer stream.
+        for s in STREAMS[x.device]
+            s === caller_stream && continue
+            ev = CUDA.CuEvent()
+            CUDA.record(ev, s)
+            CUDA.wait(ev, caller_stream)
+        end
     end
 end
 function sync_with_context(x::Union{Dagger.Processor,Dagger.MemorySpace})
@@ -216,9 +235,10 @@ function Dagger.move(from_proc::CuArrayDeviceProc, to_proc::CuArrayDeviceProc, x
     elseif Dagger.root_worker_id(from_proc) == Dagger.root_worker_id(to_proc)
         # Same process but different GPUs, use DtoD copy
         from_arr = unwrap(x)
-        ev = CUDA.CuEvent()
-        with_context(from_proc) do
+        ev = with_context(from_proc) do
+            ev = CUDA.CuEvent()
             CUDA.record(ev, stream())
+            return ev
         end
         
         return with_context(to_proc) do
@@ -273,9 +293,11 @@ function Dagger.move(from_proc::CuArrayDeviceProc, to_proc::CuArrayDeviceProc, x
     if from_proc == to_proc
         return x
     elseif Dagger.root_worker_id(from_proc) == Dagger.root_worker_id(to_proc)
-        ev = CUDA.CuEvent()
-        with_context(from_proc) do
+        
+        ev = with_context(from_proc) do
+            ev = CUDA.CuEvent()
             CUDA.record(ev, stream())
+            return ev
         end
         
         return with_context(to_proc) do
@@ -297,6 +319,45 @@ function Dagger.move(from_proc::CuArrayDeviceProc, to_proc::CuArrayDeviceProc, x
     end
 end
 
+# Out-of-place move for LinearAlgebra wrappers (UpperTriangular, LowerTriangular, etc.)
+# Unwraps the parent CuArray, moves it to the target device, and rewraps.
+# This fixes "cannot take the GPU address of inaccessible device memory" when
+# norm/isapprox fetches a wrapper chunk that lives on a different GPU.
+for W in (:UpperTriangular, :LowerTriangular, :UnitUpperTriangular, :UnitLowerTriangular)
+    @eval function Dagger.move(from_proc::CuArrayDeviceProc, to_proc::CuArrayDeviceProc,
+                               x::LinearAlgebra.$W{T,<:CuArray}) where T
+        moved = Dagger.move(from_proc, to_proc, parent(x))
+        return LinearAlgebra.$W(moved)
+    end
+    @eval function Dagger.move(from_proc::CPUProc, to_proc::CuArrayDeviceProc,
+                               x::LinearAlgebra.$W)
+        moved = Dagger.move(from_proc, to_proc, parent(x))
+        return LinearAlgebra.$W(moved)
+    end
+    @eval function Dagger.move(from_proc::CuArrayDeviceProc, to_proc::CPUProc,
+                               x::LinearAlgebra.$W{T,<:CuArray}) where T
+        moved = Dagger.move(from_proc, to_proc, parent(x))
+        return LinearAlgebra.$W(moved)
+    end
+end
+for W in (:Adjoint, :Transpose)
+    @eval function Dagger.move(from_proc::CuArrayDeviceProc, to_proc::CuArrayDeviceProc,
+                               x::LinearAlgebra.$W{T,<:CuArray}) where T
+        moved = Dagger.move(from_proc, to_proc, parent(x))
+        return LinearAlgebra.$W(moved)
+    end
+    @eval function Dagger.move(from_proc::CPUProc, to_proc::CuArrayDeviceProc,
+                               x::LinearAlgebra.$W)
+        moved = Dagger.move(from_proc, to_proc, parent(x))
+        return LinearAlgebra.$W(moved)
+    end
+    @eval function Dagger.move(from_proc::CuArrayDeviceProc, to_proc::CPUProc,
+                               x::LinearAlgebra.$W{T,<:CuArray}) where T
+        moved = Dagger.move(from_proc, to_proc, parent(x))
+        return LinearAlgebra.$W(moved)
+    end
+end
+
 # Adapt generic functions
 Dagger.move(from_proc::CPUProc, to_proc::CuArrayDeviceProc, x::Function) = x
 Dagger.move(from_proc::CPUProc, to_proc::CuArrayDeviceProc, x::Chunk{T}) where {T<:Function} =
@@ -307,29 +368,36 @@ const ROUNDROBIN = Dict{Int, Threads.Atomic{Int}}()
 # Task execution
 function Dagger.execute!(proc::CuArrayDeviceProc, f, args...; kwargs...)
     @nospecialize f args kwargs
-    opt = get_options()
+    opt = Dagger.get_options()
     tls = Dagger.get_tls()
     mydev = proc.device
-    cr_str = mod1(Threads.atomic_add!(ROUNDROBIN[dev], 1), length(STREAMS[dev]))
-    mytid = task_id()
+    cr_str = mod1(Threads.atomic_add!(ROUNDROBIN[mydev], 1), length(STREAMS[mydev]))
+    mytid = Dagger.task_id()
     task = Threads.@spawn begin
         Dagger.set_tls!(tls)
         with_context!(proc, cr_str)
-        lock(SYNCDEPS) do
-            if _has_option(opt, syncdeps)
-                syncdeps = map(syncdep -> syncdep.id.id, collect(get_options(:syncdeps)))
-                for syncdep in syncdeps 
-                    (dev, stream) = SYNCDEPS[syncdep]
+        lock(SYNCDEPS) do deps
+            local_sync = Dagger._has_option(opt, :syncdeps) ? Dagger.get_options(:syncdeps) : nothing
+            if !isnothing(local_sync)
+                local_sync = map(syncdep -> syncdep.id.id, collect(local_sync))
+                for syncdep in local_sync
+                    (dev, stream) = deps[syncdep]
                     ev = CUDA.CuEvent()
                     CUDA.record(ev, STREAMS[dev][stream])
-                    CUDA.wait(ev, cr_str)                
+                    CUDA.wait(ev, STREAMS[mydev][cr_str]) #cr_str is an Int not a custream            
                 end
             end
-            SYNCDEPS[mytid] = (mydev, cr_str)
+            deps[mytid] = (mydev, cr_str)
         end
         
         result = Base.@invokelatest f(args...; kwargs...)
-        # N.B. Synchronization must be done when accessing result or args
+        # Block this task's thread until *its* stream has actually finished.
+        # This is the backpressure that bounds memory: the scheduler only
+        # treats the task as done (and frees its input chunks via unsafe_free!)
+        # once the producing kernel has completed, so freed buffers are no
+        # longer pinned on a still-running stream. Concurrency is preserved
+        # because other tasks run concurrently on their own streams/threads.
+        # CUDA.synchronize(STREAMS[mydev][cr_str])
         return result
     end
 
@@ -418,17 +486,18 @@ Dagger.gpu_kernel_backend(::CuArrayDeviceProc) = CUDABackend()
 Dagger.gpu_with_device(f, proc::CuArrayDeviceProc) =
     CUDA.device!(f, proc.device)
 function Dagger.gpu_synchronize(proc::CuArrayDeviceProc)
-    user_stream = stream()
-
+    @assert !Dagger.in_task()
     with_context(proc) do
-        ev = CUDA.CuEvent()
-        CUDA.record(ev, stream())
-        CUDA.wait(ev, user_stream)
-
+        # Host-blocking sync. This is a barrier: callers (e.g. reclaim/GC paths)
+        # rely on all GPU work being *finished* on return, not merely chained on
+        # the host stream via a device-side CUDA.wait (which never blocks the
+        # host and let reclaim() run while kernels were still in flight).
+        for proc_stream in STREAMS[proc.device]
+            CUDA.synchronize(proc_stream)
+        end
     end
 end
 function Dagger.gpu_synchronize(::Val{:CUDA})
-    user_stream = stream()
     for dev in CUDA.devices()
         proc = CuArrayDeviceProc(myid(), dev.handle, CUDA.uuid(dev))
         Dagger.gpu_synchronize(proc)
@@ -465,12 +534,12 @@ Dagger.scope_key_precedence(::Val{:cuda_gpus}) = 1
 const DEVICES = Dict{Int, CuDevice}()
 const CONTEXTS = Dict{Int, CuContext}()
 const STREAMS = Dict{Int, Vector{CuStream}}()
-const SYNCDEPS = Dagger.LockedObject(Dict{Int, Tuple{Int, Int}}())
+const SYNCDEPS = Dagger.LockedObject(Dict{Int, Tuple{Int,Int}}())
 
 function __init__()
     if CUDA.has_cuda()
         for dev in CUDA.devices()
-            ROUNDROBIN[dev] = Threads.Atomic{Int}(1)
+            ROUNDROBIN[dev.handle] = Threads.Atomic{Int}(1)
             @debug "Registering CUDA GPU processor with Dagger: $dev"
             Dagger.add_processor_callback!("cuarray_device_$(dev.handle)") do
                 proc = CuArrayDeviceProc(myid(), dev.handle, CUDA.uuid(dev))
@@ -478,7 +547,10 @@ function __init__()
                 ctx = context(dev)
                 CONTEXTS[dev.handle] = ctx
                 context!(ctx) do
-                    STREAMS[dev.handle] = stream()
+                    num_sm = 4
+                    #Int(CUDA.attribute(dev, CUDA.DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT))
+                    num_streams =  num_sm
+                    STREAMS[dev.handle] = [CuStream() for _ in 1:num_streams]
                 end
                 return proc
             end

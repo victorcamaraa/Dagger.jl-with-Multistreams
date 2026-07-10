@@ -11,8 +11,8 @@ NVTX.@range "profile_zone" begin
     end
 
     gpu_scope1 = Dagger.scope(cuda_gpu=1)
-    gpu_scope2 = Dagger.scope(cuda_gpu=2)
-    gpu_scope_multi = Dagger.scope(cuda_gpus=:)
+    #gpu_scope2 = Dagger.scope(cuda_gpu=2)
+    #gpu_scope_multi = Dagger.scope(cuda_gpus=:)
 
     function matrix()
         tsize = 8192
@@ -58,16 +58,17 @@ NVTX.@range "profile_zone" begin
     CUDA.allowscalar(true) #
     GC.gc(true); CUDA.reclaim()
 
-    Dagger.with_options(; scope= gpu_scope_multi) do
+    Dagger.with_options(; scope= gpu_scope1) do
+        println("RTX 5060TI + RTX3060")
         #println("\n-----------------------cholesky-----------------------\n")
         #include("array/linalg/cholesky.jl")
-        #GC.gc(true); CUDA.reclaim()
-        println("\n-----------------------lu-----------------------\n")
-        include("array/linalg/lu.jl")
-        #GC.gc(true); CUDA.reclaim()
-        #println("\n-----------------------matmul-----------------------\n")
-        #include("array/linalg/matmul.jl")
-        #GC.gc(true); CUDA.reclaim()
+        GC.gc(true); CUDA.reclaim()
+        #println("\n-----------------------lu-----------------------\n")
+        #include("array/linalg/lu.jl")
+        GC.gc(true); CUDA.reclaim()
+        println("\n-----------------------matmul-----------------------\n")
+        include("array/linalg/matmul.jl")
+        GC.gc(true); CUDA.reclaim()
     end
 
 
