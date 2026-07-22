@@ -390,7 +390,6 @@ end
 # Task execution
 function Dagger.execute!(proc::CuArrayDeviceProc, f, args...; kwargs...)
     @nospecialize f args kwargs
-    opt = Dagger.get_options()
     tls = Dagger.get_tls()
     mydev = proc.device
     cr_str = pick_stream(mydev)
@@ -400,14 +399,21 @@ function Dagger.execute!(proc::CuArrayDeviceProc, f, args...; kwargs...)
         Dagger.set_tls!(tls)
         with_context!(proc, cr_str)
         lock(SYNCDEPS) do deps
-            local_sync = Dagger._has_option(opt, :syncdeps) ? Dagger.get_options(:syncdeps) : nothing
+            # N.B. `Dagger.get_options()` only carries the *propagated* options
+            # (those named in `options.propagates`, empty by default), so it never
+            # holds :syncdeps — reading it there silently disabled all cross-stream
+            # synchronization. The real set lives on the TLS task spec.
+            local_sync = tls.task_spec.options.syncdeps
             if !isnothing(local_sync)
-                local_sync = map(syncdep -> syncdep.id.id, collect(local_sync))
                 for syncdep in local_sync
-                    (dev, stream) = deps[syncdep]
+                    # Absent ⇒ producer was not a GPU task, so Dagger's host-side
+                    # completion already ordered us against it.
+                    entry = get(deps, syncdep.id.id, nothing)
+                    isnothing(entry) && continue
+                    (dev, stream) = entry
                     ev = CUDA.CuEvent()
                     CUDA.record(ev, STREAMS[dev][stream])
-                    CUDA.wait(ev, STREAMS[mydev][cr_str]) #cr_str is an Int not a custream            
+                    CUDA.wait(ev, STREAMS[mydev][cr_str]) #cr_str is an Int not a custream
                 end
             end
             deps[mytid] = (mydev, cr_str)
@@ -572,9 +578,8 @@ function __init__()
                 ctx = context(dev)
                 CONTEXTS[dev.handle] = ctx
                 context!(ctx) do
-                    num_sm = 8
-                    #Int(CUDA.attribute(dev, CUDA.DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT))
-                    num_streams =  num_sm
+                    # num_sm = Int(CUDA.attribute(dev, CUDA.DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT))
+                    num_streams = 32
                     STREAMS[dev.handle] = [CuStream() for _ in 1:num_streams]
                     STREAM_QUEUES[dev.handle] = [Threads.Atomic{Int}(0) for _ in 1:num_streams]
                 end
