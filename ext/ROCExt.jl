@@ -84,7 +84,11 @@ Dagger.with_context!(space::ROCVRAMMemorySpace) = with_context!(space)
 function with_context(f, x, stream_idx = 1)
     old_ctx = context()
     old_device = AMDGPU.device()
-    old_stream = stream()
+    # N.B. Never call `AMDGPU.stream()` here: it lazily creates a task-local HIPStream
+    # (~8 MiB of host RAM, freed only when the task is GC'd) for any task that doesn't
+    # already have one. Dagger runs one Julia task per Dagger task, so that is one fresh
+    # stream per task and tens of GB of host RAM for a large datadeps DAG.
+    old_stream = AMDGPU.task_local_state().streams[old_device.device_id]
 
     with_context!(x, stream_idx)
     try
@@ -92,7 +96,7 @@ function with_context(f, x, stream_idx = 1)
     finally
         context!(old_ctx)
         AMDGPU.device!(old_device)
-        stream!(old_stream)
+        old_stream === nothing || stream!(old_stream)
     end
 end
 
@@ -352,6 +356,14 @@ function Dagger.execute!(proc::ROCArrayDeviceProc, f, args...; kwargs...)
         stk = current_exceptions(task)
         err, frames = stk[1]
         rethrow(CapturedException(err, frames))
+    finally
+        # AMDGPU caches a rocBLAS handle in task-local storage and only returns it to the
+        # idle pool from a finalizer on the Julia task. One task per Dagger task means
+        # hundreds of live handles per datadeps DAG (and, with a non-zero
+        # ROCBLAS_DEVICE_MEMORY_SIZE, a workspace each until VRAM runs out). Run that
+        # finalizer now that the task is done so the handles get recycled: measured
+        # 380 live handles -> 4.
+        finalize(task)
     end
 end
 
@@ -493,7 +505,7 @@ function __init__()
                 ctx = HIPContext(dev)
                 CONTEXTS[dev.device_id] = ctx
                 context!(ctx) do
-                    num_streams = 8
+                    num_streams = 16
                     STREAMS[dev.device_id] = [HIPStream() for _ in 1:num_streams]
                     STREAM_QUEUES[dev.device_id] = [Threads.Atomic{Int}(0) for _ in 1:num_streams]
                 end

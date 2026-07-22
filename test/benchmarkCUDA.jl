@@ -15,7 +15,15 @@ BENCH_SAMPLES   → timed runs per configuration (warm-up not counted)
 WARMUP_RUNS     → discarded runs before timing starts
 MIN_FREE_VRAM_GIB → skip a config if any participating GPU has less free VRAM
 
-RUN_MATMUL / RUN_TRANSPOSE / RUN_ELEMENTWISE → toggle operations
+RUN_MATMUL / RUN_TRANSPOSE / RUN_ELEMENTWISE / RUN_SATURATE / RUN_DAG → toggle ops
+RUN_DAG_LINEAR / RUN_DAG_DIAMOND / RUN_DAG_CHAINLINK / RUN_DAG_TANGLED → toggle DAG shapes
+
+RUN_SATURATE is not part of the size/block grid: it runs ONCE per scope at a fixed
+shape (SATURATE_SIZE/SATURATE_BLOCK), with as many concurrent independent matmuls
+as free VRAM allows — its only goal is to drive GPU utilization to 100%.
+
+Every run also writes its full report to
+test/benchresults/"benchmark CUDA results <n>.md".
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -65,12 +73,29 @@ const WARMUP_RUNS       = 2     # discarded warm-up runs
 const RUN_MATMUL        = false   # A * B
 const RUN_TRANSPOSE     = false  # A'
 const RUN_ELEMENTWISE   = false  # A .* B
-const RUN_SATURATE      = true  # N independent A*B launched concurrently to fill every stream
+const RUN_SATURATE      = false  # N independent A*B launched concurrently to fill every stream
+const RUN_DAG           = true   # DAG-shaped graphs of matmul nodes (see DAG_TOPOLOGIES)
 
-# Saturation: number of independent matmuls launched at once. Each keeps a slice
-# of the stream pool busy; enough of them saturate the whole GPU. Peak VRAM is
-# ~SATURATE_COUNT × 3 matrices, so raise it only as far as VRAM allows.
-const SATURATE_COUNT    = 4
+# Which DAG topologies to run — toggle each shape like the RUN_* flags above.
+const RUN_DAG_LINEAR    = true   # X → X → X → …           (DAG_CHAIN_LENGTH sequential nodes)
+const RUN_DAG_DIAMOND   = true   # S ⇉ (B1 ∥ B2) → J       (fan-out, two parallel nodes, join)
+const RUN_DAG_CHAINLINK = true   # DAG_CHAIN_LENGTH diamonds welded end to end
+const RUN_DAG_TANGLED   = true   # 2 sources → crossed layer → crossed layer → 1 sink
+
+const DAG_TOPOLOGIES = [t for (flag, t) in
+    ((RUN_DAG_LINEAR, :linear), (RUN_DAG_DIAMOND, :diamond),
+     (RUN_DAG_CHAINLINK, :chainlink), (RUN_DAG_TANGLED, :tangled)) if flag]
+
+# Stages: sequential nodes in :linear, diamonds in :chainlink.
+const DAG_CHAIN_LENGTH  = 3
+
+# Saturation: ONE standalone run whose only goal is to peg the GPU at 100%.
+# It ignores MATRIX_SIZES/BLOCK_SIZES entirely — shape is irrelevant here, only
+# occupancy matters. Size/block are fixed below; the number of concurrent
+# independent matmuls is derived from free VRAM at run time (saturate_count).
+const SATURATE_SIZE     = 4096   # square side of each independent problem
+const SATURATE_BLOCK    = 1024   # tile size — small tiles ⇒ many tasks ⇒ every stream fed
+const SATURATE_MAX      = 32     # cap on concurrent problems
 
 # Skip a config if any participating GPU has less than this much free VRAM.
 const MIN_FREE_VRAM_GIB = 1.5
@@ -96,13 +121,19 @@ function gpu_vram_info(device_id::Int)
     return (free_gib = free_b / 2^30, total_gib = total_b / 2^30)
 end
 
+# N.B. NVML.Device has no CuDevice method — it takes a UUID/String/Integer, so the
+# old CuDevice call threw on every sample and the catch turned the whole column into
+# "N/A". And `utilization_rates` returns fractions (CUDA.jl divides by 100), not
+# percents, so it needs the ×100 to match the rest of the report.
+# NVML's own sampling window is ~1 s, so regions shorter than that under-report the
+# mean; the peak is the trustworthy figure.
 function _sample_util(device_ids::Vector{Int})
     best = NaN
     for id in device_ids
         try
-            dev  = CUDA.NVML.Device(CUDA.CuDevice(id))
+            dev  = CUDA.NVML.Device(CUDA.uuid(CUDA.CuDevice(id)))
             util = CUDA.NVML.utilization_rates(dev)
-            v    = Float64(util.compute)
+            v    = Float64(util.compute) * 100
             best = isnan(best) ? v : max(best, v)
         catch
         end
@@ -178,7 +209,7 @@ function bench_function(f::Function, procs::Vector;
         min       = minimum(times_s),
         mean      = mean(times_s),
         max       = maximum(times_s),
-        std       = std(times_s),
+        std       = length(times_s) > 1 ? std(times_s) : 0.0,
         median    = median(times_s),
         util_peak = util_peak,
         util_mean = util_mean,
@@ -221,25 +252,129 @@ function run_elementwise(rows, cols, blk_r, blk_c, scope)
     end
 end
 
+# How many independent problems fit: 3 matrices each, 60% of the tightest GPU's
+# free VRAM (the rest is CUBLAS workspace + tile copies).
+function saturate_count(procs::Vector)
+    free_gib = minimum(gpu_vram_info(p.device).free_gib for p in procs)
+    per_gib  = 3 * SATURATE_SIZE^2 * sizeof(Float32) / 2^30
+    return clamp(floor(Int, 0.6 * free_gib / per_gib), 2, SATURATE_MAX)
+end
+
 # Launch `count` independent matmuls concurrently. `mul!` blocks its calling
 # task (its datadeps region waits), so each problem runs in its own Julia task;
 # the regions touch disjoint memory and overlap, keeping every stream busy at
-# once — this is what saturates the whole GPU.
-function run_saturate(rows, inner, cols, blk_r, blk_c, scope; count = SATURATE_COUNT)
-    results = Vector{Any}(undef, count)
-    @sync for i in 1:count
-        Threads.@spawn begin
-            Dagger.with_options(; scope) do
-                A = rand(Blocks(blk_r, blk_c), Float32, rows, inner)
-                B = rand(Blocks(blk_c, blk_c), Float32, inner, cols)
-                C = rand(Blocks(blk_c, blk_c), Float32, rows, cols)
-                mul!(C, A, B)
-                results[i] = collect(C)
-                free_darray!(A); free_darray!(B); free_darray!(C)
-            end
+# once — this is what saturates the whole GPU. Nothing is collected back: a D2H
+# copy would stall the streams and drop utilization, and the values are unused.
+function run_saturate(count, scope)
+    @sync for _ in 1:count
+        Threads.@spawn Dagger.with_options(; scope) do
+            A = rand(Blocks(SATURATE_BLOCK, SATURATE_BLOCK), Float32, SATURATE_SIZE, SATURATE_SIZE)
+            B = rand(Blocks(SATURATE_BLOCK, SATURATE_BLOCK), Float32, SATURATE_SIZE, SATURATE_SIZE)
+            C = rand(Blocks(SATURATE_BLOCK, SATURATE_BLOCK), Float32, SATURATE_SIZE, SATURATE_SIZE)
+            mul!(C, A, B)
+            free_darray!(A); free_darray!(B); free_darray!(C)
         end
     end
-    return results
+    return nothing
+end
+
+# DAG topologies. Every node is a matmul (C := A*B) spawned tile-by-tile into a
+# SINGLE `spawn_datadeps` region. DAG edges are encoded by In/InOut on the shared
+# chunks, so datadeps runs independent nodes concurrently (overlapping across
+# streams) and serializes dependent ones — all from one submitting task. This is
+# what keeps it deadlock-free: nested `spawn_datadeps` + `Threads.@spawn` would
+# submit two datadeps regions from two Julia tasks at once, which wedges Dagger's
+# eager scheduler on its state.lock/EAGER_ID_MAP locks.
+# Uses square rows×rows matrices (cols is ignored — chained matmuls need square).
+dag_matmuls(t) = t === :linear    ? DAG_CHAIN_LENGTH :
+                 t === :diamond   ? 3 :
+                 t === :chainlink ? 3 * DAG_CHAIN_LENGTH :
+                 t === :tangled   ? 5 :
+                 error("unknown DAG topology: $t")
+
+# One DAG node: C := A*B, spawned as per-tile `BLAS.gemm!` tasks into the current
+# datadeps region (dispatched to CUBLAS on GPU chunks). Mirrors Dagger's own
+# `gemm_dagger!` inner loop but without opening its own region, so many nodes
+# share one region and overlap.
+function dag_gemm!(C::DArray, A::DArray, B::DArray)
+    Ac, Bc, Cc = A.chunks, B.chunks, C.chunks
+    Ant = size(Ac, 2)
+    for n in axes(Cc, 2), m in axes(Cc, 1)
+        for k in 1:Ant
+            beta = k == 1 ? 0f0 : 1f0          # k==1 overwrites C, later k accumulate
+            Dagger.@spawn BLAS.gemm!('N', 'N', 1f0,
+                Dagger.In(Ac[m, k]), Dagger.In(Bc[k, n]),
+                beta, Dagger.InOut(Cc[m, n]))
+        end
+    end
+    return C
+end
+
+function run_dag(topology, sz, blk, scope)
+    Dagger.with_options(; scope) do
+        live = DArray[]                 # every allocation, freed together at the end
+        alloc!() = (A = rand(Blocks(blk, blk), Float32, sz, sz); push!(live, A); A)
+
+        # Pre-allocate every matrix (sources + one output per node) up front, then
+        # run the whole DAG in one datadeps region. Output chunks are overwritten
+        # (beta=0 on the first k), so their random init is irrelevant.
+        # ponytail: every matrix stays live until the run ends; free-as-consumed
+        # if large chainlinks hit the VRAM guard.
+        out = if topology === :linear
+            X = alloc!(); M = alloc!()
+            outs = [alloc!() for _ in 1:DAG_CHAIN_LENGTH]
+            Dagger.spawn_datadeps() do
+                cur = X
+                for o in outs
+                    dag_gemm!(o, cur, M); cur = o
+                end
+            end
+            outs[end]
+
+        elseif topology === :diamond
+            S = alloc!(); M1 = alloc!(); M2 = alloc!()
+            B1 = alloc!(); B2 = alloc!(); J = alloc!()
+            Dagger.spawn_datadeps() do
+                dag_gemm!(B1, S, M1)        # ┐ independent branches:
+                dag_gemm!(B2, S, M2)        # ┘ overlap across streams
+                dag_gemm!(J, B1, B2)        # join
+            end
+            J
+
+        elseif topology === :chainlink
+            S = alloc!(); M1 = alloc!(); M2 = alloc!()
+            stages = [(alloc!(), alloc!(), alloc!()) for _ in 1:DAG_CHAIN_LENGTH]
+            Dagger.spawn_datadeps() do
+                cur = S
+                for (b1, b2, snext) in stages
+                    dag_gemm!(b1, cur, M1)  # ┐ diamond branches overlap
+                    dag_gemm!(b2, cur, M2)  # ┘
+                    dag_gemm!(snext, b1, b2)  # weld to next diamond
+                    cur = snext
+                end
+            end
+            stages[end][3]
+
+        elseif topology === :tangled
+            S1 = alloc!(); S2 = alloc!()
+            T1 = alloc!(); T2 = alloc!(); U1 = alloc!(); U2 = alloc!(); J = alloc!()
+            Dagger.spawn_datadeps() do
+                dag_gemm!(T1, S1, S2)       # ┐ layer 1 (independent)
+                dag_gemm!(T2, S2, S1)       # ┘
+                dag_gemm!(U1, T1, T2)       # ┐ layer 2 (independent, cross-consume)
+                dag_gemm!(U2, T2, T1)       # ┘
+                dag_gemm!(J, U1, U2)        # sink
+            end
+            J
+
+        else
+            error("unknown DAG topology: $topology")
+        end
+
+        result = collect(out)
+        foreach(free_darray!, live)
+        result
+    end
 end
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -358,16 +493,23 @@ function print_gpu_table(all_procs)
     println()
 end
 
+# Stream pool size for a GPU, straight from CUDAExt's per-device STREAMS pool.
+n_streams(p) = length(Base.get_extension(Dagger, :CUDAExt).STREAMS[p.device])
+
 function print_config(scope_entries)
     ops = filter(!isempty, [
-        RUN_MATMUL      ? "MatMul"      : "",
-        RUN_TRANSPOSE   ? "Transpose"   : "",
-        RUN_ELEMENTWISE ? "Elementwise" : "",
+        RUN_MATMUL      ? "MatMul"                              : "",
+        RUN_TRANSPOSE   ? "Transpose"                           : "",
+        RUN_ELEMENTWISE ? "Elementwise"                         : "",
+        RUN_SATURATE    ? "Saturate($(SATURATE_SIZE)², auto count)"  : "",
+        RUN_DAG         ? "DAG($(join(DAG_TOPOLOGIES, ",")))"   : "",
     ])
     labels = [e.label for e in scope_entries]
     println("  BENCHMARK CONFIGURATION")
     println(banner('─'))
     println("  Scopes          : $(join(labels, "  |  "))")
+    bench_procs = unique(reduce(vcat, e.procs for e in scope_entries))
+    println("  Streams/GPU     : $(join(["GPU $(p.device): $(n_streams(p))" for p in bench_procs], ", "))  ($STREAM_STRATEGY)")
     println("  Samples/Warm-up : $BENCH_SAMPLES / $WARMUP_RUNS")
     println("  Matrix sizes    : $(join(["$(r)×$(c)" for (r,c) in MATRIX_SIZES], ", "))")
     println("  Block sizes     : $(join(["$(r)×$(c)" for (r,c) in BLOCK_SIZES],  ", "))")
@@ -512,6 +654,32 @@ function print_footer(results::Vector{BenchResult}, total_s::Float64 = 0.0, n_sk
 end
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  Report file — same output as the console, next to this script,
+#  numbered so successive runs never overwrite each other.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+const REPORT_DIR    = joinpath(@__DIR__, "benchresults")
+const REPORT_PREFIX = joinpath(REPORT_DIR, "benchmark CUDA results")
+
+function write_report(results, scope_entries, total_s, n_skipped)
+    mkpath(REPORT_DIR)
+    i = 1
+    while isfile("$REPORT_PREFIX $i.md"); i += 1; end
+    path = "$REPORT_PREFIX $i.md"
+    open(path, "w") do io
+        redirect_stdout(io) do
+            println("```")   # fixed-width report — fence it so markdown keeps the columns
+            print_header()
+            print_config(scope_entries)
+            print_results_table(results)
+            print_footer(results, total_s, n_skipped)
+            println("```")
+        end
+    end
+    return path
+end
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  Scope entry — bundles everything a run needs
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -588,7 +756,8 @@ function main()
     n_skipped = 0
     t_start   = time_ns()
 
-    n_ops   = RUN_MATMUL + RUN_TRANSPOSE + RUN_ELEMENTWISE + RUN_SATURATE
+    n_ops   = RUN_MATMUL + RUN_TRANSPOSE + RUN_ELEMENTWISE +
+              (RUN_DAG ? length(DAG_TOPOLOGIES) : 0)
     total   = length(MATRIX_SIZES) * length(BLOCK_SIZES) * n_ops * length(scope_entries)
     idx     = 0
 
@@ -697,35 +866,36 @@ function main()
                     end
                 end
 
-                # ── Saturate (concurrent independent matmuls) ─────────────
-                if RUN_SATURATE
-                    idx  += 1
-                    inner = cols
+                # ── DAG topologies ────────────────────────────────────────
+                if RUN_DAG
+                    for topo in DAG_TOPOLOGIES
+                        idx += 1
 
-                    @printf("\r  [%d/%d] Saturate×%d %dx%d  blk=%dx%d  scope=%s …%-10s",
-                        idx, total, SATURATE_COUNT, rows, cols, eff_blk_r, eff_blk_c, entry.label, "")
-                    flush(stdout)
+                        @printf("\r  [%d/%d] DAG:%s %dx%d  blk=%dx%d  scope=%s …%-10s",
+                            idx, total, topo, rows, rows, eff_blk_r, eff_blk_r, entry.label, "")
+                        flush(stdout)
 
-                    force_reclaim!(entry.procs)
+                        force_reclaim!(entry.procs)
 
-                    if !enough_vram(entry.procs)
-                        @printf("\r  [%d/%d] SKIPPED (low VRAM)  scope=%s\n",
-                            idx, total, entry.label)
-                        n_skipped += 1
-                    else
-                        stats = bench_function(entry.procs) do
-                            run_saturate(rows, inner, cols, eff_blk_r, eff_blk_c, entry.scope)
+                        if !enough_vram(entry.procs)
+                            @printf("\r  [%d/%d] SKIPPED (low VRAM)  scope=%s\n",
+                                idx, total, entry.label)
+                            n_skipped += 1
+                        else
+                            stats = bench_function(entry.procs) do
+                                run_dag(topo, rows, eff_blk_r, entry.scope)
+                            end
+
+                            push!(results, BenchResult(
+                                "DAG:$topo", entry.label,
+                                (rows, rows), nothing,
+                                (eff_blk_r, eff_blk_r),
+                                stats.min, stats.mean, stats.max, stats.std, stats.median,
+                                dag_matmuls(topo) * gflops_matmul(rows, rows, rows, stats.mean),
+                                nothing,
+                                stats.util_peak, stats.util_mean,
+                            ))
                         end
-
-                        push!(results, BenchResult(
-                            "Saturate×$SATURATE_COUNT", entry.label,
-                            (rows, inner), (inner, cols),
-                            (eff_blk_r, eff_blk_c),
-                            stats.min, stats.mean, stats.max, stats.std, stats.median,
-                            SATURATE_COUNT * gflops_matmul(rows, inner, cols, stats.mean),
-                            nothing,
-                            stats.util_peak, stats.util_mean,
-                        ))
                     end
                 end
 
@@ -733,12 +903,44 @@ function main()
         end  # block sizes
     end  # matrix sizes
 
+    # ── Saturate: one standalone run per scope, outside the config grid ────────
+    # Runs once, at a fixed shape, with as many concurrent problems as VRAM takes.
+    if RUN_SATURATE
+        for entry in scope_entries
+            force_reclaim!(entry.procs)
+            count = saturate_count(entry.procs)
+
+            @printf("\r  Saturate×%d  %dx%d  blk=%dx%d  scope=%s …%-10s",
+                count, SATURATE_SIZE, SATURATE_SIZE,
+                SATURATE_BLOCK, SATURATE_BLOCK, entry.label, "")
+            flush(stdout)
+
+            # One warm-up (compilation would swamp the numbers), one timed run.
+            stats = bench_function(entry.procs; warmup = 1, samples = 1) do
+                run_saturate(count, entry.scope)
+            end
+
+            push!(results, BenchResult(
+                "Saturate×$count", entry.label,
+                (SATURATE_SIZE, SATURATE_SIZE), nothing,
+                (SATURATE_BLOCK, SATURATE_BLOCK),
+                stats.min, stats.mean, stats.max, stats.std, stats.median,
+                count * gflops_matmul(SATURATE_SIZE, SATURATE_SIZE, SATURATE_SIZE, stats.mean),
+                nothing,
+                stats.util_peak, stats.util_mean,
+            ))
+        end
+    end
+
     total_s = (time_ns() - t_start) / 1e9
 
     # Clear the progress line before printing the table
     print("\r" * " "^LINE_WIDTH * "\r")
     print_results_table(results)
     print_footer(results, total_s, n_skipped)
+
+    path = write_report(results, scope_entries, total_s, n_skipped)
+    println("  Report written to: $path")
 
     return results
 end
