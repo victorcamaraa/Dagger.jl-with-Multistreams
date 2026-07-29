@@ -294,52 +294,106 @@ const STREAM_STRATEGY = Ref{Symbol}(:roundrobin)
 """
     stream_strategy!(s::Symbol)
 
-Set the stream distribution strategy: `:roundrobin`, `:random`, or
-`:sdq` (shortest stream queue). Also settable via the
+Set the stream distribution strategy: `:roundrobin`, `:random`,
+`:sdq` (shortest stream queue), or `:locality` (run a task on the stream that
+produced its inputs, falling back to shortest-queue when that stream is
+overloaded or no on-device producer exists). Also settable via the
 `DAGGER_ROCM_STREAM_STRATEGY` environment variable at load time.
 """
 function stream_strategy!(s::Symbol)
-    s in (:roundrobin, :random, :sdq) ||
-        throw(ArgumentError("unknown stream strategy: $s (use :roundrobin, :random, or :sdq)"))
+    s in (:roundrobin, :random, :sdq, :locality) ||
+        throw(ArgumentError("unknown stream strategy: $s (use :roundrobin, :random, :sdq, or :locality)"))
     STREAM_STRATEGY[] = s
 end
 
-function pick_stream(dev::Int)
+# ponytail: follow the producer stream unless it's this many tasks deeper than
+# the shortest queue; tune from benchmarks if :locality over-/under-concentrates.
+const LOCALITY_SLACK = Ref(2)
+
+# Shortest-queue stream index for `dev`.
+sdq_stream(dev::Int, n::Int) = argmin(i -> STREAM_QUEUES[dev][i][], 1:n)
+
+# Producer task uid for a syncdep, handling both the ThunkID-wrapped form
+# (`.id.id`) and the post-submission thunk-wrapped form (`.id === nothing`).
+# Matches the key written by `execute!` (`deps[task_id()]`), since `task_id()`
+# and `Thunk.id` are both the task uid.
+function producer_uid(s)
+    s.id !== nothing && return s.id.id
+    return Dagger.unwrap_weak(s).id
+end
+
+# Locality: the on-device producer stream carrying the most of this task's
+# inputs, unless it's overloaded relative to the shortest queue.
+function locality_stream(dev::Int, local_sync, deps)
+    n = length(STREAMS[dev])
+    local_sync === nothing && return sdq_stream(dev, n)
+    counts = nothing
+    for syncdep in local_sync
+        entry = get(deps, producer_uid(syncdep), nothing)
+        entry === nothing && continue
+        (sdev, sstr) = entry
+        sdev == dev || continue                 # cross-device producer ⇒ not stream-local
+        counts === nothing && (counts = zeros(Int, n))
+        counts[sstr] += 1
+    end
+    counts === nothing && return sdq_stream(dev, n)  # no on-device producer to follow
+    best = argmax(counts)
+    minidx = sdq_stream(dev, n)
+    return (STREAM_QUEUES[dev][best][] - STREAM_QUEUES[dev][minidx][]) > LOCALITY_SLACK[] ?
+        minidx : best
+end
+
+# `local_sync`/`deps` are only consulted by the :locality strategy.
+function pick_stream(dev::Int, local_sync=nothing, deps=nothing)
     n = length(STREAMS[dev])
     s = STREAM_STRATEGY[]
     if s == :roundrobin
         return mod1(Threads.atomic_add!(ROUNDROBIN[dev], 1), n)
     elseif s == :random
         return rand(1:n)
+    elseif s == :locality
+        return locality_stream(dev, local_sync, deps)
     else # :sdq
-        return argmin(i -> STREAM_QUEUES[dev][i][], 1:n)
+        return sdq_stream(dev, n)
     end
 end
 
 # Task execution
 function Dagger.execute!(proc::ROCArrayDeviceProc, f, args...; kwargs...)
     @nospecialize f args kwargs
-    opt = Dagger.get_options()
     tls = Dagger.get_tls()
     mydev = proc.device_id
-    cr_str = pick_stream(mydev)
-    Threads.atomic_add!(STREAM_QUEUES[mydev][cr_str], 1)
     mytid = Dagger.task_id()
+    # N.B. `Dagger.get_options()` only carries the *propagated* options (those
+    # named in `options.propagates`, empty by default), so it never holds
+    # :syncdeps — reading it there silently disabled all cross-stream sync. The
+    # real set lives on the TLS task spec.
+    local_sync = tls.task_spec.options.syncdeps
     task = Threads.@spawn begin
         Dagger.set_tls!(tls)
-        with_context!(proc, cr_str)
-        lock(SYNCDEPS) do deps
-            local_sync = Dagger._has_option(opt, :syncdeps) ? Dagger.get_options(:syncdeps) : nothing
+        # Pick this task's stream while holding the SYNCDEPS lock: the :locality
+        # strategy reads the producer→stream map (`deps`) to co-locate with inputs.
+        cr_str = lock(SYNCDEPS) do deps
+            s = pick_stream(mydev, local_sync, deps)
+            Threads.atomic_add!(STREAM_QUEUES[mydev][s], 1)
             if !isnothing(local_sync)
-                local_sync = map(syncdep -> syncdep.id.id, collect(local_sync))
                 for syncdep in local_sync
-                    (dev, stream_idx) = deps[syncdep]
+                    # Absent ⇒ producer was not a GPU task, so Dagger's host-side
+                    # completion already ordered us against it.
+                    entry = get(deps, producer_uid(syncdep), nothing)
+                    isnothing(entry) && continue
+                    (dev, stream_idx) = entry
+                    # Same stream ⇒ already ordered in-order; no event needed.
+                    (dev == mydev && stream_idx == s) && continue
+                    Threads.atomic_add!(_EVENT_COUNT, 1)
                     ev = record_event(STREAMS[dev][stream_idx])
-                    stream_wait_event(STREAMS[mydev][cr_str], ev)
+                    stream_wait_event(STREAMS[mydev][s], ev)
                 end
             end
-            deps[mytid] = (mydev, cr_str)
+            deps[mytid] = (mydev, s)
+            return s
         end
+        with_context!(proc, cr_str)
 
         result = try
             Base.@invokelatest f(args...; kwargs...)
@@ -490,6 +544,9 @@ const CONTEXTS = Dict{Int, HIPContext}()
 const STREAMS = Dict{Int, Vector{HIPStream}}()
 const SYNCDEPS = Dagger.LockedObject(Dict{Int, Tuple{Int,Int}}())
 
+# Cross-stream sync events actually recorded — telemetry read by test/benchmark.jl.
+const _EVENT_COUNT = Threads.Atomic{Int}(0)
+
 function __init__()
     if haskey(ENV, "DAGGER_ROCM_STREAM_STRATEGY")
         stream_strategy!(Symbol(ENV["DAGGER_ROCM_STREAM_STRATEGY"]))
@@ -505,7 +562,7 @@ function __init__()
                 ctx = HIPContext(dev)
                 CONTEXTS[dev.device_id] = ctx
                 context!(ctx) do
-                    num_streams = 16
+                    num_streams = 8
                     STREAMS[dev.device_id] = [HIPStream() for _ in 1:num_streams]
                     STREAM_QUEUES[dev.device_id] = [Threads.Atomic{Int}(0) for _ in 1:num_streams]
                 end
