@@ -356,11 +356,60 @@ Dagger.move(from_proc::CPUProc, to_proc::CuArrayDeviceProc, x::Chunk{T}) where {
     Dagger.move(from_proc, to_proc, fetch(x))
 
 const ROUNDROBIN = Dict{Int, Threads.Atomic{Int}}()
-# Per-stream count of tasks assigned but not yet finished.
-# ponytail: host-side occupancy, not true device queue depth; upgrade to
-# CuEvent polling if SDQ decisions look off in benchmarks.
+# Per-stream count of tasks picked but not yet *finished on the device*.
 const STREAM_QUEUES = Dict{Int, Vector{Threads.Atomic{Int}}}()
 const STREAM_STRATEGY = Ref{Symbol}(:roundrobin)
+
+# Device-side queue depth, for :sdq and :locality.
+#
+# The decrement cannot happen when `f` returns: a launch returns in tens of µs
+# while the kernel runs for milliseconds, so the counter read all-zeros and
+# `argmin` — which returns the *first* minimiser — handed every task to stream 1.
+# Measured on an H200: sdq and locality pinned at busy≈0.99 for every stream
+# count and every shape, i.e. single-stream, while roundrobin reached 6.55.
+#
+# So each worker records an event after its launch, and `reap!` credits back the
+# ones that have completed. A stream is in-order, so its events complete in order
+# and we stop at the first pending one. `isdone` costs ~0.36 µs, so sweeping 32
+# streams is ~12 µs against a ~200 µs task-arrival gap.
+#
+# The slot (the atomic the pick incremented) travels with the event, so a stream
+# pool rebuilt mid-run credits the old counters harmlessly rather than driving
+# the new ones negative.
+const StreamPending = Tuple{CuEvent,Threads.Atomic{Int}}
+const STREAM_PENDING = Dict{Tuple{Int,Int},Vector{StreamPending}}()
+const PENDING_LOCK = ReentrantLock()
+
+function _drain!(q::Vector{StreamPending})
+    k = 0
+    while k < length(q) && CUDA.isdone(q[k+1][1])
+        Threads.atomic_sub!(q[k+1][2], 1)
+        k += 1
+    end
+    k > 0 && deleteat!(q, 1:k)
+    return
+end
+
+function note_launch!(dev::Int, idx::Int, slot::Threads.Atomic{Int})
+    ev = CuEvent(CUDA.EVENT_DISABLE_TIMING)
+    CUDA.record(ev, STREAMS[dev][idx])
+    lock(PENDING_LOCK) do
+        q = get!(() -> StreamPending[], STREAM_PENDING, (dev, idx))
+        push!(q, (ev, slot))
+        # Drain here too: `reap!` is only reached via `sdq_stream`, so under
+        # :roundrobin/:random nothing would ever pop the queue and it would grow
+        # one CuEvent per task forever.
+        _drain!(q)
+    end
+end
+
+function reap!(dev::Int, idx::Int)
+    lock(PENDING_LOCK) do
+        q = get(STREAM_PENDING, (dev, idx), nothing)
+        q === nothing || _drain!(q)
+        return
+    end
+end
 
 """
     stream_strategy!(s::Symbol)
@@ -377,12 +426,38 @@ function stream_strategy!(s::Symbol)
     STREAM_STRATEGY[] = s
 end
 
-# ponytail: follow the producer stream unless it's this many tasks deeper than
-# the shortest queue; tune from benchmarks if :locality over-/under-concentrates.
-const LOCALITY_SLACK = Ref(2)
+# Follow the producer's stream unless it is more than LOCALITY_SLACK *times*
+# deeper than the shallowest one.
+#
+# Relative, not absolute: the depth scale depends on how much work is in flight.
+# It was 0-1 while the counter was host-side, and is 5-30 now that it counts
+# device-side work, so the old absolute threshold of 2 silently turned into
+# "always bail", degrading :locality into :sdq.
+#
+# `max(dmin, 1)` keeps the rule meaningful when the shallowest stream is empty:
+# with a plain ratio, dmin = 0 would make any non-empty producer stream lose.
+#
+# Tuned on an RTX 5060 Ti (:spin, 8 ms tasks, 1/32 of the GPU each). Locality
+# wall at N=32, and its ratio to roundrobin:
+#   slack   chainlink (deep chain)   saturate (wide, independent)
+#    1.0        230 ms  (1.59x)            120 ms  (1.02x)
+#    2.0        278 ms  (1.97x)             85 ms  (0.72x)  <- best geomean
+#    4.0        383 ms  (2.66x)             87 ms  (0.73x)
+#    Inf        639 ms  (4.34x)             83 ms  (0.73x)
+# The shapes want opposite things: deep chains want spreading, wide independent
+# DAGs want co-location. 2.0 is the compromise, and the only setting where
+# locality beats roundrobin at all. It never wins on chainlink at any value.
+const LOCALITY_SLACK = Ref(2.0)
 
-# Shortest-queue stream index for `dev`.
-sdq_stream(dev::Int, n::Int) = argmin(i -> STREAM_QUEUES[dev][i][], 1:n)
+follow_producer(dbest::Int, dmin::Int) = dbest <= max(dmin, 1) * LOCALITY_SLACK[]
+
+# Shortest-queue stream index for `dev`, after crediting completed work.
+function sdq_stream(dev::Int, n::Int)
+    for i in 1:n
+        reap!(dev, i)
+    end
+    return argmin(i -> STREAM_QUEUES[dev][i][], 1:n)
+end
 
 # Producer task uid for a syncdep, handling both the ThunkID-wrapped form
 # (`.id.id`) and the post-submission thunk-wrapped form (`.id === nothing`).
@@ -409,9 +484,9 @@ function locality_stream(dev::Int, local_sync, deps)
     end
     counts === nothing && return sdq_stream(dev, n)  # no on-device producer to follow
     best = argmax(counts)
-    minidx = sdq_stream(dev, n)
-    return (STREAM_QUEUES[dev][best][] - STREAM_QUEUES[dev][minidx][]) > LOCALITY_SLACK[] ?
-        minidx : best
+    minidx = sdq_stream(dev, n)                     # also reaps every stream
+    return follow_producer(STREAM_QUEUES[dev][best][], STREAM_QUEUES[dev][minidx][]) ?
+        best : minidx
 end
 
 # `local_sync`/`deps` are only consulted by the :locality strategy.
@@ -454,13 +529,16 @@ const STREAM_WORKERS_LOCK = ReentrantLock()
 function stream_worker(dev::Int, idx::Int)
     ch = Channel{Any}(Inf)
     Threads.@spawn begin
-        for (out, tls, f, args, kwargs) in ch
+        for (out, tls, f, args, kwargs, slot) in ch
             try
                 Dagger.set_tls!(tls)
                 # Re-read the pool each time so a rebuilt stream set is picked up.
                 with_context!(dev, idx)
-                put!(out, Base.@invokelatest f(args...; kwargs...))
+                r = Base.@invokelatest f(args...; kwargs...)
+                note_launch!(dev, idx, slot)    # after the work is enqueued
+                put!(out, r)
             catch err
+                Threads.atomic_sub!(slot, 1)    # nothing reached the device
                 put!(out, CapturedException(err, catch_backtrace()))
             end
         end
@@ -486,9 +564,12 @@ function Dagger.execute!(proc::CuArrayDeviceProc, f, args...; kwargs...)
     # strategy reads the producer→stream map (`deps`) to co-locate with inputs.
     # Publishing our entry here (rather than after `f`) keeps it visible to a
     # consumer as soon as we return, exactly as before.
-    cr_str = lock(SYNCDEPS) do deps
+    cr_str, slot = lock(SYNCDEPS) do deps
         s = pick_stream(mydev, local_sync, deps)
-        Threads.atomic_add!(STREAM_QUEUES[mydev][s], 1)
+        # Capture the very atomic we increment: `reap!` credits this same object
+        # even if the stream pool is rebuilt before the kernel completes.
+        slot = STREAM_QUEUES[mydev][s]
+        Threads.atomic_add!(slot, 1)
         if !isnothing(local_sync)
             for syncdep in local_sync
                 # Absent ⇒ producer was not a GPU task, so Dagger's host-side
@@ -505,16 +586,14 @@ function Dagger.execute!(proc::CuArrayDeviceProc, f, args...; kwargs...)
             end
         end
         deps[mytid] = (mydev, s)
-        return s
+        return (s, slot)
     end
 
     out = Channel{Any}(1)
-    put!(worker_for(mydev, cr_str), (out, tls, f, args, kwargs))
-    result = try
-        take!(out)
-    finally
-        Threads.atomic_sub!(STREAM_QUEUES[mydev][cr_str], 1)
-    end
+    put!(worker_for(mydev, cr_str), (out, tls, f, args, kwargs, slot))
+    # N.B. no decrement here — the slot is credited by `reap!` once the device
+    # signals completion, which is the whole point of the counter.
+    result = take!(out)
     # N.B. Synchronization must be done when accessing result or args
     result isa CapturedException && throw(result)
     return result
