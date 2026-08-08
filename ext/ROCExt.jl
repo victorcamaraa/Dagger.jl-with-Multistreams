@@ -358,6 +358,47 @@ function pick_stream(dev::Int, local_sync=nothing, deps=nothing)
     end
 end
 
+# One long-lived worker task per (device, stream); all work for a stream runs there.
+#
+# Mirror of the CUDAExt fix. AMDGPU caches a rocBLAS handle per *Julia task* and
+# re-binds it with `rocblas_set_stream` whenever that task's stream differs
+# (AMDGPU `src/cache.jl:102-132`, the structural twin of CUDA.jl's
+# `CUBLAS.handle()`). Running every GPU op in a fresh `Threads.@spawn`ed task
+# meant almost every op re-bound a recycled handle onto a different stream.
+# Pinning a task per stream binds each handle once; a stream's ops are in-order
+# anyway, so serializing their launches costs nothing.
+#
+# This also subsumes the old `finalize(task)` workaround below: there is no
+# longer a per-op task whose finalizer has to recycle a handle — each worker
+# holds exactly one handle for the life of the process.
+#
+# ponytail: a worker lives until the process exits; fine for a fixed stream pool.
+# Deadlocks if `f` itself submits GPU work to its own stream and waits — datadeps
+# leaf kernels never do.
+const STREAM_WORKERS = Dict{Tuple{Int,Int},Channel{Any}}()
+const STREAM_WORKERS_LOCK = ReentrantLock()
+
+function stream_worker(dev::Int, idx::Int)
+    ch = Channel{Any}(Inf)
+    Threads.@spawn begin
+        for (out, tls, f, args, kwargs) in ch
+            try
+                Dagger.set_tls!(tls)
+                # Re-read the pool each time so a rebuilt stream set is picked up.
+                with_context!(dev, idx)
+                put!(out, Base.@invokelatest f(args...; kwargs...))
+            catch err
+                put!(out, CapturedException(err, catch_backtrace()))
+            end
+        end
+    end
+    return ch
+end
+
+worker_for(dev::Int, idx::Int) = lock(STREAM_WORKERS_LOCK) do
+    get!(() -> stream_worker(dev, idx), STREAM_WORKERS, (dev, idx))
+end
+
 # Task execution
 function Dagger.execute!(proc::ROCArrayDeviceProc, f, args...; kwargs...)
     @nospecialize f args kwargs
@@ -369,56 +410,41 @@ function Dagger.execute!(proc::ROCArrayDeviceProc, f, args...; kwargs...)
     # :syncdeps — reading it there silently disabled all cross-stream sync. The
     # real set lives on the TLS task spec.
     local_sync = tls.task_spec.options.syncdeps
-    task = Threads.@spawn begin
-        Dagger.set_tls!(tls)
-        # Pick this task's stream while holding the SYNCDEPS lock: the :locality
-        # strategy reads the producer→stream map (`deps`) to co-locate with inputs.
-        cr_str = lock(SYNCDEPS) do deps
-            s = pick_stream(mydev, local_sync, deps)
-            Threads.atomic_add!(STREAM_QUEUES[mydev][s], 1)
-            if !isnothing(local_sync)
-                for syncdep in local_sync
-                    # Absent ⇒ producer was not a GPU task, so Dagger's host-side
-                    # completion already ordered us against it.
-                    entry = get(deps, producer_uid(syncdep), nothing)
-                    isnothing(entry) && continue
-                    (dev, stream_idx) = entry
-                    # Same stream ⇒ already ordered in-order; no event needed.
-                    (dev == mydev && stream_idx == s) && continue
-                    Threads.atomic_add!(_EVENT_COUNT, 1)
-                    ev = record_event(STREAMS[dev][stream_idx])
-                    stream_wait_event(STREAMS[mydev][s], ev)
-                end
+    # Pick this task's stream while holding the SYNCDEPS lock: the :locality
+    # strategy reads the producer→stream map (`deps`) to co-locate with inputs.
+    # Publishing our entry here (rather than after `f`) keeps it visible to a
+    # consumer as soon as we return, exactly as before.
+    cr_str = lock(SYNCDEPS) do deps
+        s = pick_stream(mydev, local_sync, deps)
+        Threads.atomic_add!(STREAM_QUEUES[mydev][s], 1)
+        if !isnothing(local_sync)
+            for syncdep in local_sync
+                # Absent ⇒ producer was not a GPU task, so Dagger's host-side
+                # completion already ordered us against it.
+                entry = get(deps, producer_uid(syncdep), nothing)
+                isnothing(entry) && continue
+                (dev, stream_idx) = entry
+                # Same stream ⇒ already ordered in-order; no event needed.
+                (dev == mydev && stream_idx == s) && continue
+                Threads.atomic_add!(_EVENT_COUNT, 1)
+                ev = record_event(STREAMS[dev][stream_idx])
+                stream_wait_event(STREAMS[mydev][s], ev)
             end
-            deps[mytid] = (mydev, s)
-            return s
         end
-        with_context!(proc, cr_str)
-
-        result = try
-            Base.@invokelatest f(args...; kwargs...)
-        finally
-            Threads.atomic_sub!(STREAM_QUEUES[mydev][cr_str], 1)
-        end
-        # N.B. Synchronization must be done when accessing result or args
-        return result
+        deps[mytid] = (mydev, s)
+        return s
     end
 
-    try
-        fetch(task)
-    catch err
-        stk = current_exceptions(task)
-        err, frames = stk[1]
-        rethrow(CapturedException(err, frames))
+    out = Channel{Any}(1)
+    put!(worker_for(mydev, cr_str), (out, tls, f, args, kwargs))
+    result = try
+        take!(out)
     finally
-        # AMDGPU caches a rocBLAS handle in task-local storage and only returns it to the
-        # idle pool from a finalizer on the Julia task. One task per Dagger task means
-        # hundreds of live handles per datadeps DAG (and, with a non-zero
-        # ROCBLAS_DEVICE_MEMORY_SIZE, a workspace each until VRAM runs out). Run that
-        # finalizer now that the task is done so the handles get recycled: measured
-        # 380 live handles -> 4.
-        finalize(task)
+        Threads.atomic_sub!(STREAM_QUEUES[mydev][cr_str], 1)
     end
+    # N.B. Synchronization must be done when accessing result or args
+    result isa CapturedException && throw(result)
+    return result
 end
 
 # Adapt BLAS/LAPACK functions

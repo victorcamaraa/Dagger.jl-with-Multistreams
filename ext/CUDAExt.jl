@@ -429,6 +429,49 @@ function pick_stream(dev::Int, local_sync=nothing, deps=nothing)
     end
 end
 
+# One long-lived worker task per (device, stream); all work for a stream runs there.
+#
+# Why: CUDA.jl caches a cuBLAS handle per *Julia task* and re-binds it with
+# `cublasSetStream_v2` whenever that task's stream differs (CUBLAS.jl:78-110).
+# Dagger ran every GPU op in a fresh `Threads.@spawn`ed task, so with N streams
+# almost every op re-bound a recycled handle onto a different stream, and cuBLAS
+# reallocated its per-stream workspace each time. That cost is invisible at N=1
+# (the stream never changes) and grows with scattering, which is exactly why the
+# blind strategies collapsed as stream count rose while :locality — which
+# concentrates onto one stream — looked immune.
+#
+# Pinning a task per stream fixes it with public API only: the worker's handle is
+# bound once and, because a stream's ops are in-order anyway, serializing their
+# launches costs nothing. A shared handle without a dedicated task is NOT an
+# option — cuBLAS handles are not thread-safe and segfault under concurrent use.
+#
+# ponytail: a worker lives until the process exits; fine for a fixed stream pool.
+# Deadlocks if `f` itself submits GPU work to its own stream and waits — datadeps
+# leaf kernels never do.
+const STREAM_WORKERS = Dict{Tuple{Int,Int},Channel{Any}}()
+const STREAM_WORKERS_LOCK = ReentrantLock()
+
+function stream_worker(dev::Int, idx::Int)
+    ch = Channel{Any}(Inf)
+    Threads.@spawn begin
+        for (out, tls, f, args, kwargs) in ch
+            try
+                Dagger.set_tls!(tls)
+                # Re-read the pool each time so a rebuilt stream set is picked up.
+                with_context!(dev, idx)
+                put!(out, Base.@invokelatest f(args...; kwargs...))
+            catch err
+                put!(out, CapturedException(err, catch_backtrace()))
+            end
+        end
+    end
+    return ch
+end
+
+worker_for(dev::Int, idx::Int) = lock(STREAM_WORKERS_LOCK) do
+    get!(() -> stream_worker(dev, idx), STREAM_WORKERS, (dev, idx))
+end
+
 # Task execution
 function Dagger.execute!(proc::CuArrayDeviceProc, f, args...; kwargs...)
     @nospecialize f args kwargs
@@ -439,49 +482,42 @@ function Dagger.execute!(proc::CuArrayDeviceProc, f, args...; kwargs...)
     # named in `options.propagates`, empty by default), so it never holds
     # :syncdeps — the real set lives on the TLS task spec.
     local_sync = tls.task_spec.options.syncdeps
-    task = Threads.@spawn begin
-        Dagger.set_tls!(tls)
-        # Pick this task's stream while holding the SYNCDEPS lock: the :locality
-        # strategy reads the producer→stream map (`deps`) to co-locate with inputs.
-        cr_str = lock(SYNCDEPS) do deps
-            s = pick_stream(mydev, local_sync, deps)
-            Threads.atomic_add!(STREAM_QUEUES[mydev][s], 1)
-            if !isnothing(local_sync)
-                for syncdep in local_sync
-                    # Absent ⇒ producer was not a GPU task, so Dagger's host-side
-                    # completion already ordered us against it.
-                    entry = get(deps, producer_uid(syncdep), nothing)
-                    isnothing(entry) && continue
-                    (dev, stream) = entry
-                    # Same stream ⇒ already ordered in-order; no event needed.
-                    (dev == mydev && stream == s) && continue
-                    Threads.atomic_add!(_EVENT_COUNT, 1)
-                    ev = CUDA.CuEvent()
-                    CUDA.record(ev, STREAMS[dev][stream])
-                    CUDA.wait(ev, STREAMS[mydev][s])
-                end
+    # Pick this task's stream while holding the SYNCDEPS lock: the :locality
+    # strategy reads the producer→stream map (`deps`) to co-locate with inputs.
+    # Publishing our entry here (rather than after `f`) keeps it visible to a
+    # consumer as soon as we return, exactly as before.
+    cr_str = lock(SYNCDEPS) do deps
+        s = pick_stream(mydev, local_sync, deps)
+        Threads.atomic_add!(STREAM_QUEUES[mydev][s], 1)
+        if !isnothing(local_sync)
+            for syncdep in local_sync
+                # Absent ⇒ producer was not a GPU task, so Dagger's host-side
+                # completion already ordered us against it.
+                entry = get(deps, producer_uid(syncdep), nothing)
+                isnothing(entry) && continue
+                (dev, stream) = entry
+                # Same stream ⇒ already ordered in-order; no event needed.
+                (dev == mydev && stream == s) && continue
+                Threads.atomic_add!(_EVENT_COUNT, 1)
+                ev = CUDA.CuEvent()
+                CUDA.record(ev, STREAMS[dev][stream])
+                CUDA.wait(ev, STREAMS[mydev][s])
             end
-            deps[mytid] = (mydev, s)
-            return s
         end
-        with_context!(proc, cr_str)
-
-        result = try
-            Base.@invokelatest f(args...; kwargs...)
-        finally
-            Threads.atomic_sub!(STREAM_QUEUES[mydev][cr_str], 1)
-        end
-        # N.B. Synchronization must be done when accessing result or args
-        return result
+        deps[mytid] = (mydev, s)
+        return s
     end
 
-    try
-        fetch(task)
-    catch err
-        stk = current_exceptions(task)
-        err, frames = stk[1]
-        rethrow(CapturedException(err, frames))
+    out = Channel{Any}(1)
+    put!(worker_for(mydev, cr_str), (out, tls, f, args, kwargs))
+    result = try
+        take!(out)
+    finally
+        Threads.atomic_sub!(STREAM_QUEUES[mydev][cr_str], 1)
     end
+    # N.B. Synchronization must be done when accessing result or args
+    result isa CapturedException && throw(result)
+    return result
 end
 
 # Adapt BLAS/LAPACK functions
